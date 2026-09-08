@@ -3,7 +3,7 @@ import requests
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import tkinter as tk
 from tkinter import filedialog
@@ -17,6 +17,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 # CONFIGURATION
 # ==========================================
 API_URL = "https://crs.fabhotels.com/admin/crs/fabcrs/booking/search" 
+DETAILS_API_URL = "https://crs.fabhotels.com/admin/crs/fabcrs/booking/get/"
 # ==========================================
 
 def get_tokens_via_browser():
@@ -31,7 +32,6 @@ def get_tokens_via_browser():
         print(f"Error starting Chrome: {e}")
         return None, None
         
-    # INJECT NETWORK INTERCEPTOR TO STEAL HIDDEN HEADERS
     interceptor_script = """
     const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
     XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
@@ -60,7 +60,6 @@ def get_tokens_via_browser():
     
     driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': interceptor_script})
     
-    # URL TO DIRECTLY OPEN THE BOOKING PAGE
     driver.get("https://crs.fabhotels.com/admin/crs/booking/search")
     
     print("="*60)
@@ -75,7 +74,6 @@ def get_tokens_via_browser():
     try:
         timeout = time.time() + 300 
         while time.time() < timeout:
-            # 1. Check for token in cookies
             if not token:
                 cookies = driver.get_cookies()
                 for cookie in cookies:
@@ -83,10 +81,8 @@ def get_tokens_via_browser():
                         token = cookie['value']
                         print(f"  [+] Found 'token' cookie!")
             
-            # 2. BRUTE FORCE SEARCH FOR TENANT-TOKEN
             if not tenant_token and token:
                 try:
-                    # Dump all Local Storage and Session Storage
                     script = """
                     var result = {};
                     for (var i = 0; i < localStorage.length; i++) {
@@ -101,27 +97,22 @@ def get_tokens_via_browser():
                     """
                     all_storage = driver.execute_script(script)
                     
-                    # Search logic 1: Look for any key containing 'tenant'
                     for k, v in all_storage.items():
                         if 'tenant' in k.lower():
                             uuids = re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', str(v), re.I)
                             if uuids:
                                 tenant_token = uuids[0]
-                                print(f"  [+] Found tenant-token inside key '{k}'!")
                                 break
                             elif isinstance(v, str) and len(v) > 10:
                                 tenant_token = v.strip('"\'')
-                                print(f"  [+] Found tenant text in key '{k}'!")
                                 break
                                 
-                    # Search logic 2: Look for ANY UUID that is NOT the main token
                     if not tenant_token:
                         for k, v in all_storage.items():
                             uuids = re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', str(v), re.I)
                             for uid in uuids:
                                 if uid != token:
                                     tenant_token = uid
-                                    print(f"  [+] Extracted hidden UUID from key '{k}', assuming it's tenant-token!")
                                     break
                             if tenant_token: break
                             
@@ -149,27 +140,89 @@ def get_tokens_via_browser():
 def clean_name(name):
     if pd.isna(name):
         return set()
-    cleaned = re.sub(r'[^a-z0-9\s]', '', str(name).lower())
+    # Naya Logic: Handle CamelCase without spaces (PrajapatiBhavesh -> Prajapati Bhavesh)
+    name_spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(name))
+    cleaned = re.sub(r'[^a-z0-9]', ' ', name_spaced.lower())
     return set(cleaned.split())
+
 
 def match_names(name1, name2):
     set1 = clean_name(name1)
     set2 = clean_name(name2)
+    
     if not set1 or not set2:
         return False
-    return set1 == set2 or set1.issubset(set2) or set2.issubset(set1)
+        
+    if set1.issubset(set2) or set2.issubset(set1):
+        return True
+        
+    intersection = set1.intersection(set2)
+    if intersection:
+        COMMON_WORDS = {'mr', 'mrs', 'ms', 'dr', 'md', 'mohd', 'kumar', 'singh', 'sharma', 'patel', 'das', 'gupta', 'yadav', 'devi', 'prasad', 'ali', 'khan', 'ahmed', 'shaikh'}
+        valid_words = [w for w in intersection if w not in COMMON_WORDS and len(w) >= 3]
+        if valid_words:
+            return True
+            
+    return False
+
 
 def parse_date(date_str):
     if pd.isna(date_str):
         return None
     try:
+        if isinstance(date_str, datetime):
+            return date_str.date()
+        if isinstance(date_str, pd.Timestamp):
+            return date_str.date()
+            
         return pd.to_datetime(date_str, dayfirst=True).date()
     except:
         return None
 
-def fetch_crs_data(pid, token, tenant_token, search_name):
-    print(f"  -> API Request with Name: '{search_name}'...")
+
+def extract_all_dates(date_val):
+    if pd.isna(date_val):
+        return []
+        
+    if isinstance(date_val, datetime):
+        return [date_val.date()]
+    if isinstance(date_val, pd.Timestamp):
+        return [date_val.date()]
+        
+    date_str = str(date_val).strip()
     
+    # Bracket me likhi hui (Nights) value remove karo -> e.g. "(3)"
+    clean_str = re.sub(r'\([^)]*\)', '', date_str).strip()
+    
+    try:
+        return [pd.to_datetime(clean_str, dayfirst=True).date()]
+    except:
+        pass
+        
+    valid_dates = []
+    splitters = [' - ', ' to ', '...', ' to']
+    parts = []
+    
+    for splitter in splitters:
+        if splitter in clean_str:
+            parts = clean_str.split(splitter)
+            break
+            
+    if not parts and '-' in clean_str:
+        # Split by hyphen but only if parts are long enough to be dates
+        parts = [p for p in clean_str.split('-') if len(p.strip()) >= 5]
+        
+    if parts:
+        for p in parts:
+            try:
+                valid_dates.append(pd.to_datetime(p.strip(), dayfirst=True).date())
+            except:
+                pass
+                
+    return valid_dates
+
+
+def fetch_crs_data(pid, token, tenant_token, fname, lname):
     headers = {
         'accept': 'application/json, text/plain, */*',
         'content-type': 'application/json;charset=UTF-8',
@@ -178,32 +231,50 @@ def fetch_crs_data(pid, token, tenant_token, search_name):
         'tenant-token': f'{tenant_token}',
         'token': f'{token}',
         'uri': 'admin/bookingsservice/admin',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     }
     
     payload = {
         "bookingSearchRequestDto": {
             "pageNo": 1,
-            "limit": 50, 
-            "firstName": str(search_name),
+            "limit": 200, 
+            "firstName": fname,
+            "lastName": lname,
             "propertyId": str(pid),
             "bookingStatus": -1,
             "guestStatus": -1,
             "oldSearch": False
         }
     }
-    
     try:
         response = requests.post(API_URL, headers=headers, json=payload)
         if response.status_code == 200:
             data = response.json().get('data')
             return data if data else []
-        else:
-            print(f"  -> API Error: {response.status_code} - {response.text}")
-            return []
-    except Exception as e:
-        print(f"  -> Request failed: {e}")
-        return []
+    except Exception:
+        pass
+    return []
+
+
+def fetch_booking_details(bid, token, tenant_token):
+    url = f"{DETAILS_API_URL}{bid}"
+    headers = {
+        'accept': 'application/json, text/plain, */*',
+        'cookie': f'token={token}', 
+        'tenant-token': f'{tenant_token}',
+        'token': f'{token}',
+        'uri': 'admin/bookingsservice/update',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+    }
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json().get('data', {})
+            return data.get('travellerDetails', [])
+    except Exception:
+        pass
+    return []
+
 
 def find_columns(df):
     guest_col = None
@@ -222,24 +293,39 @@ def find_columns(df):
                 guest_col = col
                 break
 
-    # NEW: Find ALL date-related columns
     for col in df.columns:
-        col_lower = str(col).lower()
-        if any(keyword in col_lower for keyword in ['date', 'c/in', 'c/out', 'check']):
+        col_lower = str(col).lower().replace(' ', '')
+        if any(keyword in col_lower for keyword in ['date', 'c/in', 'cin', 'checkin', 'c/out', 'cout', 'c/o', 'checkout', 'nights']):
             date_cols.append(col)
                 
     return guest_col, date_cols
+
 
 def process_ledger(excel_path, pid, token, tenant_token):
     print(f"\nReading Excel file: {excel_path}")
     try:
         df = pd.read_excel(excel_path)
+        guest_col, date_cols = find_columns(df)
+        
+        # Agar upar empty rows hain toh header neeche shift ho jata hai. Us case me dynamically header dhoondo.
+        if not guest_col or not date_cols:
+            df = pd.read_excel(excel_path, header=None)
+            header_idx = -1
+            for i, row in df.head(15).iterrows():
+                row_str = " ".join([str(x).lower() for x in row.values])
+                if ('guest' in row_str or 'name' in row_str) and ('date' in row_str or 'check' in row_str or 'nights' in row_str):
+                    header_idx = i
+                    break
+                    
+            if header_idx != -1:
+                df.columns = df.iloc[header_idx]
+                df = df.iloc[header_idx + 1:].reset_index(drop=True)
+                guest_col, date_cols = find_columns(df)
+                
     except Exception as e:
         print(f"Error reading Excel file: {e}")
         return
 
-    guest_col, date_cols = find_columns(df)
-    
     if not guest_col or not date_cols:
         print("Could not automatically identify columns. Please ensure columns have 'name'/'guest' and 'date'/'checkout' in their headers.")
         return
@@ -251,71 +337,149 @@ def process_ledger(excel_path, pid, token, tenant_token):
     
     print("\nProcessing ledger rows...")
     for index, row in df.iterrows():
-        ledger_name = row[guest_col]
+        ledger_name_raw = row[guest_col]
         
-        # Collect all dates available in this row
-        ledger_dates = []
-        for d_col in date_cols:
-            d = parse_date(row[d_col])
-            if d:
-                ledger_dates.append(d)
-        
-        if pd.isna(ledger_name) or not ledger_dates:
+        if pd.isna(ledger_name_raw):
             continue
             
-        print(f"\n[{index+1}] Checking Guest: '{ledger_name}' with Dates: {ledger_dates}")
-        found_bid = False
+        # Naya Logic: CamelCase ko space se alag karna (e.g. PrajapatiBhavesh -> Prajapati Bhavesh)
+        ledger_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(ledger_name_raw).strip())
         
-        name_parts = str(ledger_name).split()
+        has_checkout = False
+        ledger_dates = []
+        for d_col in date_cols:
+            extracted = extract_all_dates(row[d_col])
+            if extracted:
+                ledger_dates.extend(extracted)
+                col_lower = str(d_col).lower().replace(' ', '')
+                if any(k in col_lower for k in ['c/out', 'cout', 'c/o', 'checkout', 'nights']):
+                    has_checkout = True
         
-        for part in name_parts:
-            clean_part = re.sub(r'[^a-zA-Z0-9]', '', part)
-            if len(clean_part) < 3: 
-                continue
+        if not ledger_dates:
+            continue
+            
+        print(f"\n[{index+1}] Checking Guest: '{ledger_name}'")
+        
+        ledger_name_clean = re.sub(r'[^a-zA-Z0-9]', ' ', str(ledger_name))
+        valid_words = [p.strip() for p in ledger_name_clean.split() if len(p.strip()) >= 3]
+        
+        search_combinations = []
+        search_combinations.append((ledger_name_clean, ""))
+        search_combinations.append(("", ledger_name_clean))
+        
+        top_words = sorted(valid_words, key=len, reverse=True)[:4]
+        if len(top_words) >= 2:
+            for i in range(len(top_words)):
+                for j in range(len(top_words)):
+                    if i != j:
+                        search_combinations.append((top_words[i], top_words[j]))
+                        
+        for word in sorted(valid_words, key=len, reverse=True):
+            search_combinations.append((word, ""))
+            search_combinations.append(("", word))
+            
+        seen_combos = set()
+        unique_combinations = []
+        for combo in search_combinations:
+            if combo not in seen_combos:
+                seen_combos.add(combo)
+                unique_combinations.append(combo)
                 
-            crs_data = fetch_crs_data(pid, token, tenant_token, clean_part)
-            print(f"  -> API returned {len(crs_data)} records for '{clean_part}'")
+        valid_matches = []
+        
+        for fname_search, lname_search in unique_combinations:
+            crs_data = fetch_crs_data(pid, token, tenant_token, fname_search, lname_search)
             
             for crs_record in crs_data:
-                crs_first_name = crs_record.get('firstName', '')
-                crs_last_name = crs_record.get('lastName', '')
-                crs_full_name = f"{crs_first_name} {crs_last_name}".strip()
-                
                 crs_checkin_raw = crs_record.get('checkIn', '')
                 crs_checkout_raw = crs_record.get('checkOut', '')
                 
                 crs_checkin_date = parse_date(crs_checkin_raw)
                 crs_checkout_date = parse_date(crs_checkout_raw) 
                 
-                print(f"    - CRS Found: Name='{crs_full_name}', CI='{crs_checkin_date}', CO='{crs_checkout_date}', BID='{crs_record.get('bookingId')}'")
+                if not crs_checkin_date or not crs_checkout_date:
+                    continue
+                
+                # STEP 1: Date Match (Naya Score Logic)
+                best_sub_score = None
+                is_valid_date_overall = False
+                matched_dates_count = 0
+                
+                for l_date in ledger_dates:
+                    is_valid_date = False
+                    if has_checkout:
+                        if crs_checkin_date <= l_date <= crs_checkout_date:
+                            is_valid_date = True
+                    else:
+                        ci_buffer = crs_checkin_date - timedelta(days=2)
+                        co_buffer = crs_checkout_date + timedelta(days=2)
+                        if ci_buffer <= l_date <= co_buffer:
+                            is_valid_date = True
+                            
+                    if is_valid_date:
+                        matched_dates_count += 1
+                        is_valid_date_overall = True
+                        
+                        is_exact_co = (l_date == crs_checkout_date)
+                        is_inside = (crs_checkin_date <= l_date <= crs_checkout_date)
+                        dist_to_ci = abs((l_date - crs_checkin_date).days)
+                        dist_to_co = abs((l_date - crs_checkout_date).days)
+                        min_dist = min(dist_to_ci, dist_to_co)
+                        
+                        sub_score = (not is_exact_co, not is_inside, min_dist, dist_to_co)
+                        
+                        if best_sub_score is None or sub_score < best_sub_score:
+                            best_sub_score = sub_score
+                            
+                if not is_valid_date_overall:
+                    continue
+                    
+                # Naya tie-breaker: Jiski sabse zyada dates match hongi, wo jeetega (-ve sign for sorting priority)
+                best_score = (-matched_dates_count, best_sub_score[0], best_sub_score[1], best_sub_score[2], best_sub_score[3])
+                
+                # STEP 2: Name Match (Primary Guest)
+                crs_first_name = crs_record.get('firstName', '')
+                crs_last_name = crs_record.get('lastName', '')
+                crs_full_name = f"{crs_first_name} {crs_last_name}".strip()
                 
                 name_matches = match_names(ledger_name, crs_full_name)
+                matched_name_str = crs_full_name
                 
-                # Check if ANY of the dates from Excel match
-                date_matches = False
-                if crs_checkin_date and crs_checkout_date:
-                    for l_date in ledger_dates:
-                        if crs_checkin_date <= l_date <= crs_checkout_date:
-                            date_matches = True
-                            break
-                
-                if name_matches:
-                    print(f"      * Name Matches! Date match status: {date_matches}")
-                if date_matches:
-                    print(f"      * Date Matches! Name match status: {name_matches}")
-
-                if name_matches and date_matches:
+                # STEP 3: Deep Search (Secondary Guests)
+                if not name_matches:
                     bid = crs_record.get('bookingId')
-                    df.at[index, 'BID'] = bid
-                    found_bid = True
-                    print(f"  *** PERFECT MATCH FOUND! BID: {bid} ***")
-                    break
+                    secondary_guests = fetch_booking_details(bid, token, tenant_token)
+                    
+                    for guest in secondary_guests:
+                        sec_fname = guest.get('firstName', '')
+                        sec_lname = guest.get('lastName', '')
+                        sec_full_name = f"{sec_fname} {sec_lname}".strip()
+                        
+                        if match_names(ledger_name, sec_full_name):
+                            name_matches = True
+                            matched_name_str = sec_full_name  
+                            break
+                            
+                if name_matches:
+                    valid_matches.append({
+                        'record': crs_record,
+                        'full_name': matched_name_str,
+                        'bid': crs_record.get('bookingId'),
+                        'score': best_score
+                    })
             
-            if found_bid:
+            if valid_matches:
                 break
                 
-        if not found_bid:
-             print(f"  --- No match found for '{ledger_name}' ---")
+        if valid_matches:
+            valid_matches.sort(key=lambda x: x['score'])
+            best_match = valid_matches[0]
+            
+            bid = best_match['bid']
+            df.at[index, 'BID'] = bid
+            print(f"  *** MATCH FOUND! {best_match['full_name']} -> BID: {bid} ***")
+        else:
+             print(f"  --- No match found ---")
 
     output_path = excel_path.replace('.xlsx', '_processed.xlsx')
     try:
@@ -328,23 +492,18 @@ def process_ledger(excel_path, pid, token, tenant_token):
 if __name__ == "__main__":
     print("--- CRs BID Extraction Automation ---")
     
-    # Hide the main tkinter window
     root = tk.Tk()
     root.withdraw()
     
-    # 1. Ask for PID
     pid = input("Enter Property ID (PID): ").strip()
     if not pid:
         print("PID is required!")
         sys.exit()
 
-    # 2. Get Tokens automatically via Browser Login
     token, tenant_token = get_tokens_via_browser()
     
     if not token or not tenant_token:
-        print("\nFailed to get one or both tokens automatically.")
-        print("You can manually provide them below if you know them, otherwise the script will exit.")
-        # Fallback to manual entry if automatic fails
+        print("\nFailed to get tokens automatically.")
         token = input("Enter 'token' manually (or press enter to skip): ").strip()
         tenant_token = input("Enter 'tenant-token' manually (or press enter to skip): ").strip()
         
@@ -352,7 +511,6 @@ if __name__ == "__main__":
          print("Tokens are required. Exiting...")
          sys.exit()
 
-    # 3. Select File
     print("\nPlease select your Excel ledger file from the dialog box...")
     excel_file = filedialog.askopenfilename(
         title="Select Hotel Ledger Excel File",
@@ -363,7 +521,4 @@ if __name__ == "__main__":
         print("No file selected. Exiting...")
         sys.exit()
         
-    print(f"File selected: {excel_file}")
-    
-    # 4. Start processing
     process_ledger(excel_file, pid, token, tenant_token)
