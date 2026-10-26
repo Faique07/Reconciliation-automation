@@ -3,7 +3,9 @@ import requests
 import json
 import re
 import time
+import difflib
 from datetime import datetime, timedelta
+import os
 import sys
 import tkinter as tk
 from tkinter import filedialog
@@ -11,7 +13,6 @@ from tkinter import filedialog
 # Selenium imports
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ==========================================
 # CONFIGURATION
@@ -25,11 +26,50 @@ def get_tokens_via_browser():
     options = webdriver.ChromeOptions()
     options.add_experimental_option('excludeSwitches', ['enable-logging'])
     
+    driver = None
+    
+    # 1. Try Selenium's built-in driver management (Selenium 4.6+)
     try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-    except Exception as e:
-        print(f"Error starting Chrome: {e}")
+        driver = webdriver.Chrome(options=options)
+    except Exception as e1:
+        print(f"[-] Selenium Manager attempt: {e1}")
+        
+        # Remove any stale lock file in ~/.wdm if present
+        lock_file = os.path.expanduser(r"~/.wdm/.wdm-lock-chromedriver-win64")
+        if os.path.exists(lock_file):
+            try:
+                os.remove(lock_file)
+            except Exception:
+                pass
+        
+        # 2. Try ChromeDriverManager fallback
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+        except Exception as e2:
+            print(f"[-] ChromeDriverManager attempt failed: {e2}")
+            
+            # 3. Try standard Chrome executable paths if binary location wasn't found
+            chrome_paths = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
+            ]
+            for cp in chrome_paths:
+                if os.path.exists(cp):
+                    try:
+                        options.binary_location = cp
+                        driver = webdriver.Chrome(options=options)
+                        break
+                    except Exception:
+                        pass
+
+    if not driver:
+        print("\n[!] Error: Unable to launch Google Chrome.")
+        print("Please ensure:")
+        print("  1. Google Chrome is installed on your computer.")
+        print("  2. Your internet connection is active.")
         return None, None
         
     interceptor_script = """
@@ -140,10 +180,11 @@ def get_tokens_via_browser():
 def clean_name(name):
     if pd.isna(name):
         return set()
-    # Naya Logic: Handle CamelCase without spaces (PrajapatiBhavesh -> Prajapati Bhavesh)
     name_spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(name))
     cleaned = re.sub(r'[^a-z0-9]', ' ', name_spaced.lower())
-    return set(cleaned.split())
+    words = cleaned.split()
+    NOISE = {'thank', 'thanks', 'hotel', 'guest', 'shri', 'smt'}
+    return set([w for w in words if w not in NOISE])
 
 
 def match_names(name1, name2):
@@ -156,13 +197,33 @@ def match_names(name1, name2):
     if set1.issubset(set2) or set2.issubset(set1):
         return True
         
+    COMMON_WORDS = {'mr', 'mrs', 'ms', 'dr', 'md', 'mohd', 'kumar', 'singh', 'sharma', 'patel', 'das', 'gupta', 'yadav', 'devi', 'prasad', 'ali', 'khan', 'ahmed', 'shaikh'}
     intersection = set1.intersection(set2)
     if intersection:
-        COMMON_WORDS = {'mr', 'mrs', 'ms', 'dr', 'md', 'mohd', 'kumar', 'singh', 'sharma', 'patel', 'das', 'gupta', 'yadav', 'devi', 'prasad', 'ali', 'khan', 'ahmed', 'shaikh'}
         valid_words = [w for w in intersection if w not in COMMON_WORDS and len(w) >= 3]
         if valid_words:
             return True
             
+    # Prefix matching for truncated names (e.g., 'choudha' vs 'choudhary')
+    for w1 in set1:
+        if w1 in COMMON_WORDS or len(w1) < 4:
+            continue
+        for w2 in set2:
+            if w2 in COMMON_WORDS or len(w2) < 4:
+                continue
+            if w1.startswith(w2) or w2.startswith(w1):
+                return True
+                
+    # Fuzzy string matching for spelling variations and typos (e.g. 'sahrma' vs 'sharma', 'pooja' vs 'puja')
+    for w1 in set1:
+        if w1 in COMMON_WORDS or len(w1) < 4:
+            continue
+        for w2 in set2:
+            if w2 in COMMON_WORDS or len(w2) < 4:
+                continue
+            if difflib.SequenceMatcher(None, w1, w2).ratio() >= 0.82:
+                return True
+                
     return False
 
 
@@ -184,45 +245,70 @@ def extract_all_dates(date_val):
     if pd.isna(date_val):
         return []
         
-    if isinstance(date_val, datetime):
-        return [date_val.date()]
-    if isinstance(date_val, pd.Timestamp):
-        return [date_val.date()]
+    dates = []
+    
+    # 1. Handle datetime / Timestamp (Excel may have parsed D/M/YYYY into US M/D/YYYY)
+    if isinstance(date_val, (datetime, pd.Timestamp)):
+        d = date_val.date()
+        dates.append(d)
+        if d.day <= 12 and d.day != d.month:
+            try:
+                dates.append(datetime(d.year, d.day, d.month).date())
+            except ValueError:
+                pass
+        return dates
         
     date_str = str(date_val).strip()
-    
-    # Bracket me likhi hui (Nights) value remove karo -> e.g. "(3)"
+    if not date_str or date_str.isdigit():
+        return []
+        
     clean_str = re.sub(r'\([^)]*\)', '', date_str).strip()
     
+    # 2. Try parsing string as single date
     try:
-        return [pd.to_datetime(clean_str, dayfirst=True).date()]
-    except:
+        parsed = pd.to_datetime(clean_str, dayfirst=True).date()
+        dates.append(parsed)
+        if parsed.day <= 12 and parsed.day != parsed.month:
+            try:
+                dates.append(datetime(parsed.year, parsed.day, parsed.month).date())
+            except ValueError:
+                pass
+        return dates
+    except Exception:
         pass
         
-    valid_dates = []
+    # 3. Handle date range strings (e.g. '01/09/2026 - 02/09/2026')
     splitters = [' - ', ' to ', '...', ' to']
     parts = []
-    
     for splitter in splitters:
         if splitter in clean_str:
             parts = clean_str.split(splitter)
             break
             
     if not parts and '-' in clean_str:
-        # Split by hyphen but only if parts are long enough to be dates
         parts = [p for p in clean_str.split('-') if len(p.strip()) >= 5]
         
     if parts:
         for p in parts:
             try:
-                valid_dates.append(pd.to_datetime(p.strip(), dayfirst=True).date())
-            except:
+                parsed = pd.to_datetime(p.strip(), dayfirst=True).date()
+                dates.append(parsed)
+                if parsed.day <= 12 and parsed.day != parsed.month:
+                    try:
+                        dates.append(datetime(parsed.year, parsed.day, parsed.month).date())
+                    except ValueError:
+                        pass
+            except Exception:
                 pass
                 
-    return valid_dates
+    return dates
 
 
-def fetch_crs_data(pid, token, tenant_token, fname, lname):
+def fetch_crs_data(session, pid, token, tenant_token, fname, lname, cache=None):
+    cache_key = (str(pid), str(fname).strip().lower(), str(lname).strip().lower())
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
     headers = {
         'accept': 'application/json, text/plain, */*',
         'content-type': 'application/json;charset=UTF-8',
@@ -247,16 +333,25 @@ def fetch_crs_data(pid, token, tenant_token, fname, lname):
         }
     }
     try:
-        response = requests.post(API_URL, headers=headers, json=payload)
+        response = session.post(API_URL, headers=headers, json=payload, timeout=12)
         if response.status_code == 200:
             data = response.json().get('data')
-            return data if data else []
+            result = data if data else []
+            if cache is not None:
+                cache[cache_key] = result
+            return result
     except Exception:
         pass
+        
+    if cache is not None:
+        cache[cache_key] = []
     return []
 
 
-def fetch_booking_details(bid, token, tenant_token):
+def fetch_booking_details(session, bid, token, tenant_token, cache=None):
+    if cache is not None and bid in cache:
+        return cache[bid]
+
     url = f"{DETAILS_API_URL}{bid}"
     headers = {
         'accept': 'application/json, text/plain, */*',
@@ -267,12 +362,18 @@ def fetch_booking_details(bid, token, tenant_token):
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     }
     try:
-        response = requests.get(url, headers=headers)
+        response = session.get(url, headers=headers, timeout=12)
         if response.status_code == 200:
             data = response.json().get('data', {})
-            return data.get('travellerDetails', [])
+            details = data.get('travellerDetails', [])
+            if cache is not None:
+                cache[bid] = details
+            return details
     except Exception:
         pass
+        
+    if cache is not None:
+        cache[bid] = []
     return []
 
 
@@ -295,25 +396,35 @@ def find_columns(df):
 
     for col in df.columns:
         col_lower = str(col).lower().replace(' ', '')
-        if any(keyword in col_lower for keyword in ['date', 'c/in', 'cin', 'checkin', 'c/out', 'cout', 'c/o', 'checkout', 'nights']):
+        # Exclude duration/night count columns
+        if 'night' in col_lower:
+            continue
+        if any(keyword in col_lower for keyword in ['c/in', 'cin', 'checkin', 'c/out', 'cout', 'c/o', 'checkout', 'date']):
             date_cols.append(col)
                 
     return guest_col, date_cols
 
 
 def process_ledger(excel_path, pid, token, tenant_token):
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+
+    search_cache = {}
+    details_cache = {}
+
     print(f"\nReading Excel file: {excel_path}")
     try:
         df = pd.read_excel(excel_path)
         guest_col, date_cols = find_columns(df)
         
-        # Agar upar empty rows hain toh header neeche shift ho jata hai. Us case me dynamically header dhoondo.
         if not guest_col or not date_cols:
             df = pd.read_excel(excel_path, header=None)
             header_idx = -1
             for i, row in df.head(15).iterrows():
                 row_str = " ".join([str(x).lower() for x in row.values])
-                if ('guest' in row_str or 'name' in row_str) and ('date' in row_str or 'check' in row_str or 'nights' in row_str):
+                if ('guest' in row_str or 'name' in row_str) and ('date' in row_str or 'check' in row_str or 'cin' in row_str or 'cout' in row_str):
                     header_idx = i
                     break
                     
@@ -334,50 +445,79 @@ def process_ledger(excel_path, pid, token, tenant_token):
     print(f"Identified Date Columns: {date_cols}")
 
     df['BID'] = "NOT FOUND"
+    total_rows = len(df)
     
-    print("\nProcessing ledger rows...")
+    COMMON_TITLES = {'mr', 'mrs', 'ms', 'dr', 'md', 'mohd', 'thank', 'thanks', 'hotel', 'guest', 'shri', 'smt'}
+    COMMON_SURNAMES = {'kumar', 'singh', 'sharma', 'patel', 'das', 'gupta', 'yadav', 'devi', 'prasad', 'ali', 'khan', 'ahmed', 'shaikh'}
+
+    print(f"\nProcessing {total_rows} ledger rows...")
     for index, row in df.iterrows():
         ledger_name_raw = row[guest_col]
         
         if pd.isna(ledger_name_raw):
             continue
             
-        # Naya Logic: CamelCase ko space se alag karna (e.g. PrajapatiBhavesh -> Prajapati Bhavesh)
         ledger_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(ledger_name_raw).strip())
         
-        has_checkout = False
         ledger_dates = []
         for d_col in date_cols:
             extracted = extract_all_dates(row[d_col])
             if extracted:
                 ledger_dates.extend(extracted)
-                col_lower = str(d_col).lower().replace(' ', '')
-                if any(k in col_lower for k in ['c/out', 'cout', 'c/o', 'checkout', 'nights']):
-                    has_checkout = True
         
         if not ledger_dates:
             continue
             
-        print(f"\n[{index+1}] Checking Guest: '{ledger_name}'")
+        print(f"\n[{index+1}/{total_rows}] Checking Guest: '{ledger_name}'")
         
         ledger_name_clean = re.sub(r'[^a-zA-Z0-9]', ' ', str(ledger_name))
-        valid_words = [p.strip() for p in ledger_name_clean.split() if len(p.strip()) >= 3]
+        raw_words = [p.strip() for p in ledger_name_clean.split() if len(p.strip()) > 0]
+        
+        # Filter leading noise words like "Thank" from ledger name
+        all_words = []
+        for i, w in enumerate(raw_words):
+            if i == 0 and w.lower() in {'thank', 'thanks', 'hotel', 'guest', 'shri', 'smt'}:
+                continue
+            all_words.append(w)
+        if not all_words:
+            all_words = raw_words
+            
+        clean_full_name = " ".join(all_words)
         
         search_combinations = []
-        search_combinations.append((ledger_name_clean, ""))
-        search_combinations.append(("", ledger_name_clean))
+        # 1. Full name in First Name (matches manual CRS UI search)
+        search_combinations.append((clean_full_name, ""))
         
-        top_words = sorted(valid_words, key=len, reverse=True)[:4]
-        if len(top_words) >= 2:
-            for i in range(len(top_words)):
-                for j in range(len(top_words)):
-                    if i != j:
-                        search_combinations.append((top_words[i], top_words[j]))
-                        
-        for word in sorted(valid_words, key=len, reverse=True):
+        # 2. First and Last Name split if 2+ words
+        if len(all_words) >= 2:
+            search_combinations.append((all_words[0], " ".join(all_words[1:])))
+            search_combinations.append((all_words[0], all_words[-1]))
+            
+        # 3. Full name in Last Name
+        search_combinations.append(("", clean_full_name))
+        
+        # 4. First name only / Last name combinations (avoid standalone common surnames)
+        if len(all_words) >= 2:
+            if all_words[0].lower() not in COMMON_SURNAMES and len(all_words[0]) >= 3:
+                search_combinations.append((all_words[0], ""))
+            if all_words[-1].lower() not in COMMON_SURNAMES and len(all_words[-1]) >= 3:
+                search_combinations.append((all_words[-1], ""))
+            search_combinations.append((all_words[-1], all_words[0]))
+            
+        # 5. Significant individual distinctive words (skip common titles and common surnames)
+        search_words = [w for w in all_words if w.lower() not in COMMON_TITLES and w.lower() not in COMMON_SURNAMES and len(w) >= 3]
+        for word in sorted(search_words, key=len, reverse=True):
             search_combinations.append((word, ""))
             search_combinations.append(("", word))
             
+        # If no combinations were generated (e.g. name only consists of common surnames):
+        if not search_combinations:
+            if len(all_words) >= 2:
+                search_combinations.append((all_words[0], all_words[-1]))
+            for w in all_words:
+                if len(w) >= 3:
+                    search_combinations.append((w, ""))
+                
         seen_combos = set()
         unique_combinations = []
         for combo in search_combinations:
@@ -386,11 +526,17 @@ def process_ledger(excel_path, pid, token, tenant_token):
                 unique_combinations.append(combo)
                 
         valid_matches = []
+        seen_bids = set()
         
         for fname_search, lname_search in unique_combinations:
-            crs_data = fetch_crs_data(pid, token, tenant_token, fname_search, lname_search)
+            crs_data = fetch_crs_data(session, pid, token, tenant_token, fname_search, lname_search, search_cache)
             
             for crs_record in crs_data:
+                bid = crs_record.get('bookingId')
+                if not bid or bid in seen_bids:
+                    continue
+                seen_bids.add(bid)
+                
                 crs_checkin_raw = crs_record.get('checkIn', '')
                 crs_checkout_raw = crs_record.get('checkOut', '')
                 
@@ -400,75 +546,75 @@ def process_ledger(excel_path, pid, token, tenant_token):
                 if not crs_checkin_date or not crs_checkout_date:
                     continue
                 
-                # STEP 1: Date Match (Naya Score Logic)
-                best_sub_score = None
-                is_valid_date_overall = False
-                matched_dates_count = 0
-                
+                # --- SPEED CRITICAL: DATE PROXIMITY CHECK FIRST ---
+                # Check date distance in-memory BEFORE calling any external API
+                min_days_dist = 9999
+                best_date_score = None
                 for l_date in ledger_dates:
-                    is_valid_date = False
-                    if has_checkout:
-                        if crs_checkin_date <= l_date <= crs_checkout_date:
-                            is_valid_date = True
+                    if crs_checkin_date <= l_date <= crs_checkout_date:
+                        dist = 0
+                    elif l_date < crs_checkin_date:
+                        dist = (crs_checkin_date - l_date).days
                     else:
-                        ci_buffer = crs_checkin_date - timedelta(days=2)
-                        co_buffer = crs_checkout_date + timedelta(days=2)
-                        if ci_buffer <= l_date <= co_buffer:
-                            is_valid_date = True
-                            
-                    if is_valid_date:
-                        matched_dates_count += 1
-                        is_valid_date_overall = True
+                        dist = (l_date - crs_checkout_date).days
                         
-                        is_exact_co = (l_date == crs_checkout_date)
-                        is_inside = (crs_checkin_date <= l_date <= crs_checkout_date)
-                        dist_to_ci = abs((l_date - crs_checkin_date).days)
-                        dist_to_co = abs((l_date - crs_checkout_date).days)
-                        min_dist = min(dist_to_ci, dist_to_co)
-                        
-                        sub_score = (not is_exact_co, not is_inside, min_dist, dist_to_co)
-                        
-                        if best_sub_score is None or sub_score < best_sub_score:
-                            best_sub_score = sub_score
-                            
-                if not is_valid_date_overall:
-                    continue
+                    is_exact_co = (l_date == crs_checkout_date)
+                    is_inside = (crs_checkin_date <= l_date <= crs_checkout_date)
+                    dist_to_ci = abs((l_date - crs_checkin_date).days)
+                    dist_to_co = abs((l_date - crs_checkout_date).days)
+                    min_dist_to_edge = min(dist_to_ci, dist_to_co)
                     
-                # Naya tie-breaker: Jiski sabse zyada dates match hongi, wo jeetega (-ve sign for sorting priority)
-                best_score = (-matched_dates_count, best_sub_score[0], best_sub_score[1], best_sub_score[2], best_sub_score[3])
+                    if dist <= 3:
+                        tier = 0
+                    elif dist <= 7:
+                        tier = 1
+                    else:
+                        tier = 2
+                        
+                    date_score = (tier, not is_exact_co, not is_inside, dist, min_dist_to_edge)
+                    if best_date_score is None or date_score < best_date_score:
+                        best_date_score = date_score
+                        min_days_dist = dist
+                        
+                # If booking dates are more than 7 days away from ledger dates, it CANNOT be this booking!
+                # Skipping here in memory avoids hundreds of slow HTTP calls!
+                if min_days_dist > 7:
+                    continue
                 
-                # STEP 2: Name Match (Primary Guest)
+                # STEP 1: Name Match (Primary Guest)
                 crs_first_name = crs_record.get('firstName', '')
                 crs_last_name = crs_record.get('lastName', '')
                 crs_full_name = f"{crs_first_name} {crs_last_name}".strip()
                 
-                name_matches = match_names(ledger_name, crs_full_name)
+                name_matches = match_names(clean_full_name, crs_full_name)
                 matched_name_str = crs_full_name
                 
-                # STEP 3: Deep Search (Secondary Guests)
+                # STEP 2: Deep Search (Secondary Guests)
+                # ONLY fetch details for secondary guests if dates match AND primary name did not match
                 if not name_matches:
-                    bid = crs_record.get('bookingId')
-                    secondary_guests = fetch_booking_details(bid, token, tenant_token)
-                    
+                    secondary_guests = fetch_booking_details(session, bid, token, tenant_token, details_cache)
                     for guest in secondary_guests:
                         sec_fname = guest.get('firstName', '')
                         sec_lname = guest.get('lastName', '')
                         sec_full_name = f"{sec_fname} {sec_lname}".strip()
                         
-                        if match_names(ledger_name, sec_full_name):
+                        if match_names(clean_full_name, sec_full_name):
                             name_matches = True
                             matched_name_str = sec_full_name  
                             break
                             
-                if name_matches:
-                    valid_matches.append({
-                        'record': crs_record,
-                        'full_name': matched_name_str,
-                        'bid': crs_record.get('bookingId'),
-                        'score': best_score
-                    })
+                if not name_matches:
+                    continue
+                    
+                valid_matches.append({
+                    'record': crs_record,
+                    'full_name': matched_name_str,
+                    'bid': bid,
+                    'score': best_date_score
+                })
             
-            if valid_matches:
+            # If we found high-confidence (tier 0) date match, stop querying other combinations
+            if any(m['score'][0] == 0 for m in valid_matches):
                 break
                 
         if valid_matches:
@@ -479,14 +625,21 @@ def process_ledger(excel_path, pid, token, tenant_token):
             df.at[index, 'BID'] = bid
             print(f"  *** MATCH FOUND! {best_match['full_name']} -> BID: {bid} ***")
         else:
-             print(f"  --- No match found ---")
+            print(f"  --- No match found ---")
 
-    output_path = excel_path.replace('.xlsx', '_processed.xlsx')
+    base, _ = os.path.splitext(excel_path)
+    output_path = f"{base}_processed.xlsx"
     try:
-        df.to_excel(output_path, index=False)
+        df.to_excel(output_path, index=False, engine='openpyxl')
         print(f"\nProcessing complete! Output saved to: {output_path}")
     except Exception as e:
-        print(f"Error saving output file: {e}")
+        print(f"Error saving Excel file ({e}). Saving as CSV instead...")
+        try:
+            csv_path = f"{base}_processed.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"Output saved to CSV: {csv_path}")
+        except Exception as e2:
+            print(f"Error saving output file: {e2}")
 
 
 if __name__ == "__main__":
