@@ -5,10 +5,12 @@ import re
 import time
 import difflib
 from datetime import datetime, timedelta
+import datetime as dt_mod
 import os
 import sys
 import tkinter as tk
 from tkinter import filedialog
+import openpyxl
 
 # Selenium imports
 from selenium import webdriver
@@ -247,9 +249,18 @@ def extract_all_dates(date_val):
         
     dates = []
     
-    # 1. Handle datetime / Timestamp (Excel may have parsed D/M/YYYY into US M/D/YYYY)
+    # 1. Handle datetime / Timestamp / date (Excel may have parsed D/M/YYYY into US M/D/YYYY)
     if isinstance(date_val, (datetime, pd.Timestamp)):
         d = date_val.date()
+        dates.append(d)
+        if d.day <= 12 and d.day != d.month:
+            try:
+                dates.append(datetime(d.year, d.day, d.month).date())
+            except ValueError:
+                pass
+        return dates
+    elif isinstance(date_val, dt_mod.date):
+        d = date_val
         dates.append(d)
         if d.day <= 12 and d.day != d.month:
             try:
@@ -416,59 +427,100 @@ def process_ledger(excel_path, pid, token, tenant_token):
 
     print(f"\nReading Excel file: {excel_path}")
     try:
-        df = pd.read_excel(excel_path)
-        guest_col, date_cols = find_columns(df)
-        
-        if not guest_col or not date_cols:
-            df = pd.read_excel(excel_path, header=None)
-            header_idx = -1
-            for i, row in df.head(15).iterrows():
-                row_str = " ".join([str(x).lower() for x in row.values])
-                if ('guest' in row_str or 'name' in row_str) and ('date' in row_str or 'check' in row_str or 'cin' in row_str or 'cout' in row_str):
-                    header_idx = i
-                    break
-                    
-            if header_idx != -1:
-                df.columns = df.iloc[header_idx]
-                df = df.iloc[header_idx + 1:].reset_index(drop=True)
-                guest_col, date_cols = find_columns(df)
-                
+        wb = openpyxl.load_workbook(excel_path)
     except Exception as e:
         print(f"Error reading Excel file: {e}")
         return
 
-    if not guest_col or not date_cols:
+    # Find the target sheet and columns
+    target_sheet = None
+    guest_col_idx = None
+    date_col_indices = []
+    header_row_idx = 1
+    bid_col_idx = None
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for r in range(1, min(15, ws.max_row + 1)):
+            row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+            row_str = " ".join([str(v).lower() for v in row_vals if v is not None])
+            if ('guest' in row_str or 'name' in row_str) and ('date' in row_str or 'check' in row_str or 'cin' in row_str or 'cout' in row_str):
+                g_col = None
+                d_cols = []
+                b_col = None
+                for c in range(1, ws.max_column + 1):
+                    val = ws.cell(row=r, column=c).value
+                    if not val:
+                        continue
+                    v_str = str(val).strip()
+                    v_lower = v_str.lower()
+                    if v_lower == 'bid':
+                        b_col = c
+                    elif 'guest' in v_lower:
+                        if not g_col: g_col = c
+                    elif 'name' in v_lower and 'company' not in v_lower and 'account' not in v_lower and 'hotel' not in v_lower:
+                        if not g_col: g_col = c
+                        
+                    v_clean = v_lower.replace(' ', '')
+                    if 'night' not in v_clean and any(k in v_clean for k in ['c/in', 'cin', 'checkin', 'c/out', 'cout', 'c/o', 'checkout', 'date']):
+                        d_cols.append(c)
+
+                if g_col and d_cols:
+                    target_sheet = ws
+                    header_row_idx = r
+                    guest_col_idx = g_col
+                    date_col_indices = d_cols
+                    bid_col_idx = b_col
+                    print(f"[+] Found ledger columns in sheet '{sheet_name}' (Row {r})")
+                    break
+        if target_sheet:
+            break
+
+    if not target_sheet or not guest_col_idx or not date_col_indices:
         print("Could not automatically identify columns. Please ensure columns have 'name'/'guest' and 'date'/'checkout' in their headers.")
         return
-        
-    print(f"Identified Guest Column: '{guest_col}'")
-    print(f"Identified Date Columns: {date_cols}")
 
-    df['BID'] = "NOT FOUND"
-    total_rows = len(df)
-    
+    # If BID column doesn't exist yet, add it right after the last header column
+    if not bid_col_idx:
+        last_c = 1
+        for c in range(1, target_sheet.max_column + 1):
+            if target_sheet.cell(row=header_row_idx, column=c).value is not None:
+                last_c = c
+        bid_col_idx = last_c + 1
+        b_cell = target_sheet.cell(row=header_row_idx, column=bid_col_idx, value="BID")
+        ref_cell = target_sheet.cell(row=header_row_idx, column=guest_col_idx)
+        if ref_cell.has_style:
+            b_cell.font = openpyxl.styles.Font(name=ref_cell.font.name, size=ref_cell.font.size, bold=True)
+            b_cell.alignment = openpyxl.styles.Alignment(horizontal='center', vertical='center')
+
+    print(f"Identified Guest Column: Column {openpyxl.utils.get_column_letter(guest_col_idx)} ('{target_sheet.cell(row=header_row_idx, column=guest_col_idx).value}')")
+    print(f"Identified Date Columns: {[openpyxl.utils.get_column_letter(c) for c in date_col_indices]}")
+    print(f"Identified BID Column: Column {openpyxl.utils.get_column_letter(bid_col_idx)}")
+
+    total_rows = target_sheet.max_row - header_row_idx
     COMMON_TITLES = {'mr', 'mrs', 'ms', 'dr', 'md', 'mohd', 'thank', 'thanks', 'hotel', 'guest', 'shri', 'smt'}
     COMMON_SURNAMES = {'kumar', 'singh', 'sharma', 'patel', 'das', 'gupta', 'yadav', 'devi', 'prasad', 'ali', 'khan', 'ahmed', 'shaikh'}
 
     print(f"\nProcessing {total_rows} ledger rows...")
-    for index, row in df.iterrows():
-        ledger_name_raw = row[guest_col]
+    for row_idx, r in enumerate(range(header_row_idx + 1, target_sheet.max_row + 1)):
+        ledger_name_raw = target_sheet.cell(row=r, column=guest_col_idx).value
         
-        if pd.isna(ledger_name_raw):
+        if ledger_name_raw is None or pd.isna(ledger_name_raw):
             continue
             
         ledger_name = re.sub(r'([a-z])([A-Z])', r'\1 \2', str(ledger_name_raw).strip())
         
         ledger_dates = []
-        for d_col in date_cols:
-            extracted = extract_all_dates(row[d_col])
+        for d_col in date_col_indices:
+            val = target_sheet.cell(row=r, column=d_col).value
+            extracted = extract_all_dates(val)
             if extracted:
                 ledger_dates.extend(extracted)
         
         if not ledger_dates:
             continue
             
-        print(f"\n[{index+1}/{total_rows}] Checking Guest: '{ledger_name}'")
+        print(f"\n[{row_idx+1}/{total_rows}] Checking Guest: '{ledger_name}'")
         
         ledger_name_clean = re.sub(r'[^a-zA-Z0-9]', ' ', str(ledger_name))
         raw_words = [p.strip() for p in ledger_name_clean.split() if len(p.strip()) > 0]
@@ -510,7 +562,7 @@ def process_ledger(excel_path, pid, token, tenant_token):
             search_combinations.append((word, ""))
             search_combinations.append(("", word))
             
-        # If no combinations were generated (e.g. name only consists of common surnames):
+        # If no combinations were generated:
         if not search_combinations:
             if len(all_words) >= 2:
                 search_combinations.append((all_words[0], all_words[-1]))
@@ -547,7 +599,6 @@ def process_ledger(excel_path, pid, token, tenant_token):
                     continue
                 
                 # --- SPEED CRITICAL: DATE PROXIMITY CHECK FIRST ---
-                # Check date distance in-memory BEFORE calling any external API
                 min_days_dist = 9999
                 best_date_score = None
                 for l_date in ledger_dates:
@@ -576,8 +627,6 @@ def process_ledger(excel_path, pid, token, tenant_token):
                         best_date_score = date_score
                         min_days_dist = dist
                         
-                # If booking dates are more than 7 days away from ledger dates, it CANNOT be this booking!
-                # Skipping here in memory avoids hundreds of slow HTTP calls!
                 if min_days_dist > 7:
                     continue
                 
@@ -590,7 +639,6 @@ def process_ledger(excel_path, pid, token, tenant_token):
                 matched_name_str = crs_full_name
                 
                 # STEP 2: Deep Search (Secondary Guests)
-                # ONLY fetch details for secondary guests if dates match AND primary name did not match
                 if not name_matches:
                     secondary_guests = fetch_booking_details(session, bid, token, tenant_token, details_cache)
                     for guest in secondary_guests:
@@ -613,7 +661,7 @@ def process_ledger(excel_path, pid, token, tenant_token):
                     'score': best_date_score
                 })
             
-            # If we found high-confidence (tier 0) date match, stop querying other combinations
+            # If high-confidence match found, stop querying combinations
             if any(m['score'][0] == 0 for m in valid_matches):
                 break
                 
@@ -622,24 +670,21 @@ def process_ledger(excel_path, pid, token, tenant_token):
             best_match = valid_matches[0]
             
             bid = best_match['bid']
-            df.at[index, 'BID'] = bid
+            target_sheet.cell(row=r, column=bid_col_idx, value=bid)
             print(f"  *** MATCH FOUND! {best_match['full_name']} -> BID: {bid} ***")
         else:
+            target_sheet.cell(row=r, column=bid_col_idx, value="NOT FOUND")
             print(f"  --- No match found ---")
 
     base, _ = os.path.splitext(excel_path)
     output_path = f"{base}_processed.xlsx"
     try:
-        df.to_excel(output_path, index=False, engine='openpyxl')
-        print(f"\nProcessing complete! Output saved to: {output_path}")
+        wb.save(output_path)
+        print(f"\n======================================================")
+        print(f"[✔] Processing complete! Output saved to: {output_path}")
+        print(f"======================================================")
     except Exception as e:
-        print(f"Error saving Excel file ({e}). Saving as CSV instead...")
-        try:
-            csv_path = f"{base}_processed.csv"
-            df.to_csv(csv_path, index=False)
-            print(f"Output saved to CSV: {csv_path}")
-        except Exception as e2:
-            print(f"Error saving output file: {e2}")
+        print(f"Error saving output file: {e}")
 
 
 if __name__ == "__main__":
